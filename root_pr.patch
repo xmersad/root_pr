@@ -1,0 +1,235 @@
+--- a/init/do_mounts.c
++++ b/init/do_mounts.c
+@@ -30,6 +30,7 @@
+ int root_mountflags = MS_RDONLY | MS_SILENT;
+ static char * __initdata root_device_name;
+ static char __initdata saved_root_name[64];
++static char * __initdata root_pr_list;
+ static int root_wait;
+ 
+ dev_t ROOT_DEV;
+@@ -302,6 +303,14 @@
+ 
+ __setup("root=", root_dev_setup);
+ 
++static int __init root_pr_setup(char *line)
++{
++	root_pr_list = line;
++	return 1;
++}
++
++__setup("root_pr=", root_pr_setup);
++
+ static int __init rootwait_setup(char *str)
+ {
+ 	if (*str)
+@@ -563,8 +572,209 @@
+ 	return err;
+ }
+ 
++/*
++ * Try to mount a single root filesystem safely without panicking
++ * Returns 0 on success, -1 on failure
++ */
++static int __init try_mount_single_root(const char *root_name)
++{
++	struct page *page = alloc_page(GFP_KERNEL);
++	char *fs_names = page_address(page);
++	char *p;
++	char b[BDEVNAME_SIZE];
++	int num_fs, i;
++	int ret = -1;
++
++	if (!page)
++		return -1;
++
++	/* Handle special cases for network filesystems */
++	if (strcmp(root_name, "/dev/nfs") == 0) {
++#ifdef CONFIG_ROOT_NFS
++		put_page(page);
++		if (mount_nfs_root()) {
++			printk(KERN_INFO "VFS: Successfully mounted NFS root\n");
++			return 0;
++		}
++		printk(KERN_WARNING "VFS: Failed to mount NFS root\n");
++		return -1;
++#else
++		put_page(page);
++		printk(KERN_WARNING "VFS: NFS root not supported (CONFIG_ROOT_NFS not enabled)\n");
++		return -1;
++#endif
++	}
++
++	if (strcmp(root_name, "/dev/cifs") == 0) {
++#ifdef CONFIG_CIFS_ROOT
++		put_page(page);
++		if (mount_cifs_root()) {
++			printk(KERN_INFO "VFS: Successfully mounted CIFS root\n");
++			return 0;
++		}
++		printk(KERN_WARNING "VFS: Failed to mount CIFS root\n");
++		return -1;
++#else
++		put_page(page);
++		printk(KERN_WARNING "VFS: CIFS root not supported (CONFIG_CIFS_ROOT not enabled)\n");
++		return -1;
++#endif
++	}
++
++	/* Convert root name to dev_t */
++	if (!strncmp(root_name, "mtd", 3) ||
++	    !strncmp(root_name, "ubi", 3)) {
++		/* Handle MTD/UBI devices directly - these don't use the standard mount logic */
++		put_page(page);
++		mount_block_root((char *)root_name, root_mountflags);
++		return 0; /* If we get here, mounting succeeded */
++	}
++
++	ROOT_DEV = name_to_dev_t(root_name);
++	if (ROOT_DEV == 0) {
++		printk(KERN_WARNING "VFS: Cannot resolve root device: %s\n", root_name);
++		put_page(page);
++		return -1;
++	}
++
++	/* Create /dev/root device */
++	if (create_dev("/dev/root", ROOT_DEV) < 0) {
++		printk(KERN_WARNING "VFS: Failed to create /dev/root\n");
++		put_page(page);
++		return -1;
++	}
++
++	scnprintf(b, BDEVNAME_SIZE, "unknown-block(%u,%u)",
++		  MAJOR(ROOT_DEV), MINOR(ROOT_DEV));
++
++	if (root_fs_names)
++		num_fs = split_fs_names(fs_names, PAGE_SIZE, root_fs_names);
++	else
++		num_fs = list_bdev_fs_names(fs_names, PAGE_SIZE);
++
++	/* Try mounting with different filesystem types */
++	for (i = 0, p = fs_names; i < num_fs; i++, p += strlen(p)+1) {
++		int err;
++
++		if (!*p)
++			continue;
++		err = do_mount_root("/dev/root", p, root_mountflags, root_mount_data);
++		switch (err) {
++			case 0:
++				ret = 0;
++				goto out;
++			case -EACCES:
++			case -EINVAL:
++				continue;
++		}
++		printk(KERN_WARNING "VFS: Cannot open root device \"%s\" or %s: error %d\n",
++		       root_name, b, err);
++	}
++
++	/* Try read-only if read-write failed */
++	if (!(root_mountflags & SB_RDONLY)) {
++		for (i = 0, p = fs_names; i < num_fs; i++, p += strlen(p)+1) {
++			int err;
++
++			if (!*p)
++				continue;
++			err = do_mount_root("/dev/root", p, root_mountflags | SB_RDONLY, root_mount_data);
++			switch (err) {
++				case 0:
++					ret = 0;
++					goto out;
++				case -EACCES:
++				case -EINVAL:
++					continue;
++			}
++		}
++	}
++
++out:
++	put_page(page);
++	return ret;
++}
++
++/*
++ * Try to mount root filesystem from a priority list
++ * Format: "device1;device2;device3"
++ * Returns 0 on success, -1 on failure
++ */
++static int __init mount_root_priority_list(void)
++{
++	char *root_list, *current_root, *next_root;
++	char *root_list_copy;
++	int ret = -1;
++	int root_count = 0;
++
++	if (!root_pr_list)
++		return -1;
++
++	/* Create a copy of the root_pr_list for parsing */
++	root_list_copy = kstrdup(root_pr_list, GFP_KERNEL);
++	if (!root_list_copy)
++		return -1;
++
++	root_list = root_list_copy;
++	printk(KERN_INFO "VFS: Trying root filesystems from priority list: %s\n", root_pr_list);
++
++	/* Parse the list separated by semicolons */
++	while (root_list && *root_list) {
++		/* Find the next semicolon */
++		next_root = strchr(root_list, ';');
++		if (next_root) {
++			*next_root = '\0';
++			next_root++;
++		}
++
++		/* Trim whitespace from current root */
++		current_root = root_list;
++		while (*current_root == ' ' || *current_root == '\t')
++			current_root++;
++
++		/* Skip empty entries */
++		if (*current_root == '\0') {
++			root_list = next_root;
++			continue;
++		}
++
++		root_count++;
++		printk(KERN_INFO "VFS: Attempting to mount root filesystem #%d: %s\n", 
++		       root_count, current_root);
++
++		/* Try to mount this root filesystem */
++		ret = try_mount_single_root(current_root);
++		if (ret == 0) {
++			printk(KERN_INFO "VFS: Successfully mounted root filesystem #%d: %s\n", 
++			       root_count, current_root);
++			break;
++		}
++
++		printk(KERN_WARNING "VFS: Failed to mount root filesystem: %s\n", current_root);
++
++		/* Move to next root filesystem */
++		root_list = next_root;
++	}
++
++	kfree(root_list_copy);
++
++	if (ret != 0) {
++		printk(KERN_ERR "VFS: Failed to mount any root filesystem from priority list\n");
++	}
++
++	return ret;
++}
++
+ void __init mount_root(void)
+ {
++	/* Try root_pr priority list first if specified */
++	if (root_pr_list) {
++		if (mount_root_priority_list() == 0)
++			return;
++		/* If priority list fails, fall back to normal root mounting */
++		printk(KERN_WARNING "VFS: root_pr list failed, falling back to normal root mounting\n");
++	}
++
+ #ifdef CONFIG_ROOT_NFS
+ 	if (ROOT_DEV == Root_NFS) {
+ 		if (!mount_nfs_root())
