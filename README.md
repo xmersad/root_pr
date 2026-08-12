@@ -1,14 +1,3 @@
-# Root Priority List (root_pr) - Enablement Package
-
-This directory contains everything needed to enable the **root_pr** kernel feature on Linux 6.1.x. The root_pr feature allows specifying multiple root filesystems in priority order—if the first fails, the kernel automatically tries the next.
-
-## Contents
-
-| File | Description |
-|------|-------------|
-| `root_pr.patch` | Unified diff patch for `init/do_mounts.c` (~210 lines) |
-| `README.md` | Usage and application instructions |
-
 ## Quick Start
 
 ### 1. Apply the Patch
